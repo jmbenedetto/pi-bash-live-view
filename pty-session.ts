@@ -17,11 +17,18 @@ type TerminalEmulator = ReturnType<typeof createTerminalEmulator>;
 
 type ExitListener = (exitCode: number | null, signal?: number) => void;
 
+type ExitListenerOptions = {
+  waitForIdle?: boolean;
+};
+
 export class PtyTerminalSession {
   private readonly ptyProcess: pty.IPty;
   private readonly terminalEmulator: TerminalEmulator;
   private readonly startedAt = Date.now();
   private readonly exitListeners = new Set<ExitListener>();
+  private readonly immediateExitListeners = new Set<ExitListener>();
+  private readonly dataListeners = new Set<(chunk: string) => void>();
+  private rawOutput = '';
   private _exited = false;
   private _exitCode: number | null = null;
   private _signal: number | undefined;
@@ -54,6 +61,10 @@ export class PtyTerminalSession {
     });
 
     this.ptyProcess.onData((chunk) => {
+      this.rawOutput += chunk;
+      for (const listener of this.dataListeners) {
+        listener(chunk);
+      }
       void this.terminalEmulator.consumeProcessStdout(chunk, {
         elapsedMs: Date.now() - this.startedAt,
       });
@@ -63,6 +74,9 @@ export class PtyTerminalSession {
       this._exited = true;
       this._exitCode = exitCode;
       this._signal = signal;
+      for (const listener of [...this.immediateExitListeners]) {
+        listener(exitCode, signal);
+      }
       void this.whenIdle().then(() => {
         for (const listener of [...this.exitListeners]) {
           listener(exitCode, signal);
@@ -95,22 +109,35 @@ export class PtyTerminalSession {
     return this.terminalEmulator.rows;
   }
 
-  addExitListener(listener: ExitListener): () => void {
-    this.exitListeners.add(listener);
+  addExitListener(listener: ExitListener, { waitForIdle = true }: ExitListenerOptions = {}): () => void {
+    const listeners = waitForIdle ? this.exitListeners : this.immediateExitListeners;
+    listeners.add(listener);
     if (this._exited) {
-      void this.whenIdle().then(() => {
-        if (this.exitListeners.has(listener)) {
+      const notify = () => {
+        if (listeners.has(listener)) {
           listener(this._exitCode, this._signal);
         }
-      });
+      };
+      if (waitForIdle) {
+        void this.whenIdle().then(notify);
+      } else {
+        notify();
+      }
     }
     return () => {
-      this.exitListeners.delete(listener);
+      listeners.delete(listener);
     };
   }
 
   whenIdle(): Promise<void> {
     return this.terminalEmulator.whenIdle();
+  }
+
+  addDataListener(listener: (chunk: string) => void): () => void {
+    this.dataListeners.add(listener);
+    return () => {
+      this.dataListeners.delete(listener);
+    };
   }
 
   getViewportSnapshot() {
@@ -119,6 +146,10 @@ export class PtyTerminalSession {
 
   getStrippedTextIncludingEntireScrollback() {
     return this.terminalEmulator.getStrippedTextIncludingEntireScrollback();
+  }
+
+  getRawOutput() {
+    return this.rawOutput;
   }
 
   subscribe(listener: (payload: { elapsedMs: number; snapshot: ReturnType<TerminalEmulator['getViewportSnapshot']>; inAltScreen: boolean; inSyncRender: boolean }) => void): () => void {
@@ -136,5 +167,7 @@ export class PtyTerminalSession {
     this.kill();
     this.terminalEmulator.dispose();
     this.exitListeners.clear();
+    this.immediateExitListeners.clear();
+    this.dataListeners.clear();
   }
 }
