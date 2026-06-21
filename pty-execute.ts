@@ -1,5 +1,6 @@
-import type { BashOperations, ExtensionContext } from '@mariozechner/pi-coding-agent';
-import { getShellConfig } from '@mariozechner/pi-coding-agent';
+import type { BashOperations, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { getShellConfig } from '@earendil-works/pi-coding-agent';
+import stripAnsi from 'strip-ansi';
 import { buildAbortError, buildExitCodeError, buildSuccessfulBashResult, buildTimeoutError } from './truncate.ts';
 import { hideWidget, showWidget, type LiveSession } from './widget.ts';
 import { PtyTerminalSession } from './pty-session.ts';
@@ -8,6 +9,17 @@ export const WIDGET_DELAY_MS = 100;
 export const WIDGET_HEIGHT = 15;
 export const DEFAULT_PTY_COLS = 100;
 export const XTERM_SCROLLBACK_LINES = 100_000;
+export const STARTUP_KILL_GRACE_MS = 100;
+
+function normalizeRawOutput(rawOutput: string) {
+  const text = stripAnsi(rawOutput)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\u0000/g, '')
+    .replace(/\p{Cf}/gu, '')
+    .trimEnd();
+  return text.length === 0 ? '(no output)' : `${text}\n`;
+}
 
 async function runPtyCommand(
   id: string,
@@ -16,6 +28,7 @@ async function runPtyCommand(
   timeout: number | undefined,
   signal: AbortSignal,
   ctx: ExtensionContext,
+  onChunk?: (chunk: string) => void,
 ) {
   const shellConfig = getShellConfig();
   const cols = DEFAULT_PTY_COLS;
@@ -42,27 +55,52 @@ async function runPtyCommand(
   const unsubscribe = ptySession.subscribe(() => {
     session.requestRender?.();
   });
+  const unsubscribeData = onChunk ? ptySession.addDataListener(onChunk) : undefined;
 
   if (ctx.hasUI) {
     session.timer = setTimeout(() => showWidget(ctx, session), WIDGET_DELAY_MS);
   }
 
   let timeoutHandle: NodeJS.Timeout | undefined;
+  let delayedKillHandle: NodeJS.Timeout | undefined;
+  let cancelPendingKillOnData: (() => void) | undefined;
   let timedOut = false;
   let aborted = false;
+  let killRequested = false;
 
   const kill = () => {
+    if (delayedKillHandle) {
+      clearTimeout(delayedKillHandle);
+      delayedKillHandle = undefined;
+    }
+    cancelPendingKillOnData?.();
+    cancelPendingKillOnData = undefined;
     ptySession.kill();
+  };
+  const requestKill = () => {
+    if (killRequested) return;
+    killRequested = true;
+    if (ptySession.getRawOutput()) {
+      kill();
+      return;
+    }
+    cancelPendingKillOnData = ptySession.addDataListener(() => {
+      kill();
+    });
+    delayedKillHandle = setTimeout(() => {
+      delayedKillHandle = undefined;
+      kill();
+    }, STARTUP_KILL_GRACE_MS);
   };
   const onAbort = () => {
     aborted = true;
-    kill();
+    requestKill();
   };
 
   if (timeout && timeout > 0) {
     timeoutHandle = setTimeout(() => {
       timedOut = true;
-      kill();
+      requestKill();
     }, timeout * 1000);
   }
   if (signal.aborted) {
@@ -74,10 +112,19 @@ async function runPtyCommand(
   try {
     const exit = await new Promise<{ exitCode: number | null }>((resolve) => {
       ptySession.addExitListener((exitCode) => resolve({ exitCode }));
+      ptySession.addExitListener(() => {
+        if (session.timer) {
+          clearTimeout(session.timer);
+          session.timer = undefined;
+        }
+      }, { waitForIdle: false });
     });
 
     await ptySession.whenIdle();
-    const fullText = ptySession.getStrippedTextIncludingEntireScrollback();
+    let fullText = ptySession.getStrippedTextIncludingEntireScrollback();
+    if (fullText === '(no output)') {
+      fullText = normalizeRawOutput(ptySession.getRawOutput());
+    }
 
     return {
       fullText,
@@ -87,11 +134,14 @@ async function runPtyCommand(
     };
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
+    if (delayedKillHandle) clearTimeout(delayedKillHandle);
+    cancelPendingKillOnData?.();
     signal.removeEventListener('abort', onAbort);
     if (session.timer) clearTimeout(session.timer);
     session.disposed = true;
     hideWidget(ctx, session);
     unsubscribe();
+    unsubscribeData?.();
     ptySession.dispose();
   }
 }
@@ -120,6 +170,7 @@ export async function executePtyCommand(
 export function createPtyBashOperations(ctx: ExtensionContext): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout }) {
+      let sawChunk = false;
       const result = await runPtyCommand(
         `user-bash-${Date.now()}-${Math.random().toString(16).slice(2)}`,
         command,
@@ -127,9 +178,16 @@ export function createPtyBashOperations(ctx: ExtensionContext): BashOperations {
         timeout,
         signal ?? new AbortController().signal,
         ctx,
+        (chunk) => {
+          if (sawChunk) return;
+          const normalizedChunk = normalizeRawOutput(chunk);
+          if (normalizedChunk === '(no output)') return;
+          sawChunk = true;
+          onData(Buffer.from(normalizedChunk, 'utf8'));
+        },
       );
 
-      if (result.fullText) {
+      if (!sawChunk && result.fullText) {
         onData(Buffer.from(result.fullText, 'utf8'));
       }
       if (result.aborted) {
