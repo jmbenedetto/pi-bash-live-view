@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { tmpdir } from 'node:os';
 import { createBashTool } from '@earendil-works/pi-coding-agent';
 import { executePtyCommand } from '../pty-execute.ts';
 
@@ -26,8 +27,11 @@ async function captureResult(fn) {
 }
 
 function normalizeTempPaths(text) {
-  return String(text).replace(/\/var\/folders\/[^\]\s]+\/pi-bash-[a-f0-9]+\.log/g, '/tmp/pi-bash-XXXX.log')
-    .replace(/\/tmp\/pi-bash-[a-f0-9]+\.log/g, '/tmp/pi-bash-XXXX.log');
+  const escapedTempDir = tmpdir().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return String(text).replace(
+    new RegExp(`${escapedTempDir}[\\\\/]pi-bash-[a-f0-9]+\\.log`, 'g'),
+    '/tmp/pi-bash-XXXX.log',
+  );
 }
 
 function buildNodeCommand(source) {
@@ -64,12 +68,12 @@ test('PTY-backed bash matches built-in bash non-zero exit reporting', async () =
 test('PTY-backed bash matches built-in bash timeout error formatting', async () => {
   const command = buildNodeCommand(`
     console.log('hi');
-    setInterval(() => console.log('tick'), 50);
+    setInterval(() => {}, 1000);
   `);
 
   const [builtin, pty] = await Promise.all([
-    captureResult(() => runBuiltIn({ command, timeout: 0.1 })),
-    captureResult(() => runPty({ command, timeout: 0.1 })),
+    captureResult(() => runBuiltIn({ command, timeout: 0.25 })),
+    captureResult(() => runPty({ command, timeout: 0.25 })),
   ]);
 
   assert.equal(builtin.ok, false);
@@ -80,13 +84,13 @@ test('PTY-backed bash matches built-in bash timeout error formatting', async () 
 test('PTY-backed bash matches built-in bash abort error formatting', async () => {
   const command = buildNodeCommand(`
     console.log('starting');
-    setInterval(() => console.log('tick'), 50);
+    setInterval(() => {}, 1000);
   `);
 
   const builtinController = new AbortController();
   const ptyController = new AbortController();
-  setTimeout(() => builtinController.abort(), 100);
-  setTimeout(() => ptyController.abort(), 100);
+  setTimeout(() => builtinController.abort(), 250);
+  setTimeout(() => ptyController.abort(), 250);
 
   const [builtin, pty] = await Promise.all([
     captureResult(() => runBuiltIn({ command }, builtinController.signal)),
