@@ -45,7 +45,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "setup:linux": "npm rebuild node-pty --ignore-scripts=false"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.79.9",

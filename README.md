@@ -17,3 +17,14 @@ https://github.com/lucasmeijer/pi-bash-live-view/releases/download/readme-assets
 pi install npm:pi-bash-live-view
 ```
 
+### Linux with npm lifecycle scripts disabled
+
+`node-pty` needs a native Linux module. If your security policy reports `ignore-scripts=true`, the normal install cannot compile that module automatically. After reviewing the pinned `node-pty` dependency, run the package-scoped setup explicitly:
+
+```bash
+npm run setup:linux
+npm test
+```
+
+`setup:linux` runs `npm rebuild node-pty --ignore-scripts=false`. It does not change the global npm script policy or intentionally modify `package-lock.json`.
+
